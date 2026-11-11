@@ -1,0 +1,769 @@
+---
+title: "PLSC 508 Problem Set 2: Policy Networks in Switzerland and France"
+author: "Yasin Shafi"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    number_sections: true
+    fig_caption: true
+geometry: margin=1in
+fontsize: 11pt
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{float}
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include = FALSE, cache = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.pos = "H", cache = TRUE, autodep = TRUE)
+suppressPackageStartupMessages({
+  library(network); library(sna); library(ergm); library(latentnet); library(coda)
+})
+options(knitr.kable.NA = "")
+
+kab <- function(x, cap, align = NULL)
+  knitr::kable(x, format = "latex", booktabs = TRUE, caption = cap, position = "H",
+               align = align, row.names = FALSE, linesep = "", escape = TRUE)
+pf <- function(p) ifelse(p < .001, "p < .001", paste("p =", formatC(p, format = "f", digits = 3)))
+f2 <- function(x) formatC(x, format = "f", digits = 2)
+f3 <- function(x) formatC(x, format = "f", digits = 3)
+stars <- function(p) ifelse(p < .01, "**", ifelse(p < .05, "*", ""))
+
+# Global options
+
+set.seed(123)
+
+N_CUG <- 1000   # CUG draws
+N_QAP <- 1000   # QAP permutations
+CC    <- c(CH = "Switzerland", FR = "France")
+```
+
+# Reproducibility
+
+The data and code accompany this write-up. Place this `.Rmd` next to a
+`data/` folder holding `data_prepared.RData` and `attributeData.RData`
+from the authors' Dataverse archive (`0_Data/` and
+`1_Analysis/output/`). Every random step uses seed 123.
+
+# Data
+
+The data come from Metz and Brandenberger (2023), "Policy Networks
+Across Political Systems," *American Journal of Political Science*
+67(3): 569–586. The replication files are on the Harvard Dataverse. I
+used the data for my ERGM tutorial.
+
+In the original article, The authors surveyed actors in one policy
+process -- emerging pollutants in water -- in four countries. I compare
+two countries: Switzerland -- a consensus democracy, and France -- a
+majoritarian democracy. The authors surveyed policy actors. Each
+respondent checked the organizations it "closely collaborated" with. A
+tie $i \to j$ means $i$ named $j$ as a close collaborator. The ties are
+directed and binary.
+
+The same survey asked each actor to name its opponents and to rate its
+own policy beliefs and preferred policy instruments. I use these as
+dyadic covariates:
+
+-   **Opponent:** 1 if $i$ named $j$ as an opponent.
+-   **Belief dissimilarity:** mean absolute difference over five
+    core-belief items (1–4 scales).
+-   **Instrument dissimilarity:** mean absolute difference over nine
+    instrument items.
+
+I also use two actor attributes from the paper's model: national
+government (whether the sender or receiver was a national government
+organization) and reputation (sender, and the absolute difference
+between the two actors).
+
+Only thise who responded in the survey appear in the networks. The
+authors dropped non-respondents. Response rates were 89% in Switzerland
+and 46% in France, so the French network covers a smaller share of its
+policy field. This is a limitation for every method below. None of them
+can recover ties to actors who are not in the data.
+
+```{r data}
+load("data/data_prepared.RData")   # collabXX, oppXX, attXX
+load("data/attributeData.RData")   # attXX with imputed belief/instrument items
+
+## ---- Helper: build a network object for one country ----------------------
+## Collaboration matrix -> directed network, plus node attributes and the
+## three dyadic covariates stored as network attributes.
+make_nw <- function(collab, opp, att) {
+  # Collaboration ties (no self-loops)
+  m <- as.matrix(collab); diag(m) <- 0
+  g <- network(m, matrix.type = "adjacency", directed = TRUE)
+
+  # Node attributes
+  g %v% "actorType"  <- as.character(att$actorTypesChar)
+  g %v% "repuTarget" <- att$reputation
+
+  # Dyadic covariate: opponent nominations
+  o <- as.matrix(opp); storage.mode(o) <- "numeric"; diag(o) <- 0
+  g %n% "O" <- o
+
+  # Dyadic covariates: belief and instrument dissimilarity
+  g %n% "B" <- dissim(att, 19:23)   # imputed core-belief items
+  g %n% "I" <- dissim(att, 24:32)   # imputed instrument items
+  g
+}
+
+## ---- Helper: pairwise dissimilarity ---------------------------------------
+## Mean absolute difference between two actors across the given survey items.
+dissim <- function(att, cols) {
+  X <- as.matrix(att[, cols]); n <- nrow(X); M <- matrix(NA, n, n)
+  for (i in 1:n) for (j in 1:n) M[i, j] <- mean(abs(X[i, ] - X[j, ]), na.rm = TRUE)
+  M
+}
+
+## ---- Build the Swiss and French networks ----------------------------------
+nw <- list(CH = make_nw(collabCH, oppCH, attCH),
+           FR = make_nw(collabFR, oppFR, attFR))
+
+## ---- Table 1: descriptive statistics --------------------------------------
+desc <- data.frame(
+  Country      = CC,
+  Actors       = sapply(nw, network.size),
+  Ties         = sapply(nw, network.edgecount),
+  Density      = f3(sapply(nw, gden)),
+  `Opponent ties` = sapply(nw, function(g) sum(g %n% "O")),
+  `National gov.` = sapply(nw, function(g) sum(g %v% "actorType" == "national")),
+  check.names = FALSE)
+kab(desc, "The two collaboration networks", "lrrrrr")
+
+```
+
+The French network is less than half the size of the Swiss one but
+almost three times as dense. Raw statistics such as transitivity rise
+with density. So I compare each network with a null model that holds its
+own size and density fixed, and I do not compare raw values across
+countries.
+
+# CUG test
+
+**Question:** Are the networks more clustered and more centralized than
+random networks of the same size and density?
+
+I test two statistics. They match the paper's two hypotheses.
+
+-   **Transitivity** (share of two-paths $i \to j \to k$ closed by
+    $i \to k$). This is H2: Consensus democracies push actors to bargain and
+    build broad coalitions. So H2 expects dense, close-knit collaboration, where
+    an actor's partners also work with each other in Switzerland. Majoritarian
+    democracies reward winning alone. So H2 expects sparser, more competitive
+    ties in France. Higher transitivity relative to chance will support the
+    consensus pattern.
+-   **In-degree centralization** (how unequally incoming ties are
+    spread). This is H1: power concentrated in a few actors. Consensus
+    democracies spread power across many actors through federalism, 
+    proportional representation and corporatist bargaining. So H1 expects
+    incoming ties to be spread across several actors in Switzerland. Majoritarian
+    democracies concentrate power in a few actors, often the national
+    government.So H1 expects a few actors to receive most incoming ties in
+    France. Higher centralization relative to chance supports the majoritarian
+    pattern.
+
+I use two null distributions. The first holds the number of ties fixed
+(`cmode = "edges"`). The second also holds the number of mutual,
+asymmetric and null dyads fixed (`cmode = "dyad.census"`). The second
+null asks whether clustering goes beyond what reciprocity alone would
+produce. Each null uses `r N_CUG` draws.
+
+```{r cug}
+## ---- CUG test statistics ---------------------------------------------------
+## In-degree centralization (H1). Transitivity (H2) uses sna::gtrans directly.
+icent <- function(g) centralization(g, degree, cmode = "indegree")
+
+## ---- Helper: run one CUG test ----------------------------------------------
+## Returns the observed value, null mean, 95% null range, the upper-tail
+## p-value (share of null draws >= observed) and the raw null draws.
+cug_one <- function(g, stat, mode) {
+  set.seed(123)
+  r <- cug.test(g, stat, cmode = mode, reps = N_CUG)
+  c(obs = r$obs.stat, mean = mean(r$rep.stat),
+    lo = unname(quantile(r$rep.stat, .025)), hi = unname(quantile(r$rep.stat, .975)),
+    p = r$pgteobs, list(r$rep.stat))
+}
+
+## ---- Run all tests: 2 countries x 2 statistics x 2 nulls -------------------
+## "edges":       random graphs with the same number of ties
+## "dyad.census": same numbers of mutual, asymmetric and null dyads
+cug <- list()
+for (cc in names(nw)) for (st in c("Transitivity", "In-degree centralization")) {
+  fn <- if (st == "Transitivity") gtrans else icent
+  for (md in c("edges", "dyad.census")) cug[[paste(cc, st, md)]] <-
+    c(cc = cc, stat = st, mode = md, cug_one(nw[[cc]], fn, md))
+}
+
+## ---- Table 2: CUG results -------------------------------------------------
+## Obs./null scales the observed value by its own null mean, so the two
+## countries can be compared despite different size and density.
+cug_tab <- do.call(rbind, lapply(cug, function(x) data.frame(
+  Country = CC[x$cc], Statistic = x$stat,
+  Null = ifelse(x$mode == "edges", "Edges", "Dyad census"),
+  Observed = f3(x$obs), `Null mean` = f3(x$mean),
+  `Obs./null` = f2(x$obs / x$mean),
+  `p (obs >= null)` = f3(x$p), check.names = FALSE)))
+kab(cug_tab, sprintf("CUG tests (%d draws per null)", N_CUG), "lllrrrr")
+```
+
+```{r fig-cug, fig.width = 7.5, fig.height = 4.5, fig.cap = "CUG null distributions holding the number of ties fixed. The red line is the observed value."}
+
+## ---- Figure 1: observed vs. both null distributions ------------------------
+col_null <- c(edges       = adjustcolor("grey50", 0.5),
+              dyad.census = adjustcolor("#0072B2", 0.45))
+par(mfrow = c(2, 2), mar = c(4, 4, 2.5, 1), oma = c(2.5, 0, 0, 0))
+
+for (cc in names(nw)) for (st in c("Transitivity", "In-degree centralization")) {
+  # Null draws under each conditioning
+  e  <- cug[[paste(cc, st, "edges")]]
+  d  <- cug[[paste(cc, st, "dyad.census")]]
+  re <- e[[length(e)]]; rd <- d[[length(d)]]
+
+  # Shared bins so the two nulls overlay cleanly
+  xl <- range(c(re, rd, e$obs)); br <- seq(xl[1], xl[2], length.out = 40)
+  he <- hist(re, breaks = br, plot = FALSE); hd <- hist(rd, breaks = br, plot = FALSE)
+
+  # Overlaid histograms plus observed value
+  plot(he, col = col_null["edges"], border = NA, xlim = xl,
+       ylim = c(0, max(he$counts, hd$counts)),
+       main = paste(CC[cc], "-", st), xlab = st, cex.main = 0.9)
+  plot(hd, col = col_null["dyad.census"], border = NA, add = TRUE)
+  abline(v = e$obs, col = "firebrick", lwd = 2)
+  text(e$obs, max(he$counts, hd$counts) * 0.9, sprintf("obs = %.2f", e$obs),
+       pos = 2, cex = 0.75, col = "firebrick")
+}
+
+## ---- Shared legend below the panels ----------------------------------------
+par(fig = c(0, 1, 0, 1), oma = c(0, 0, 0, 0), mar = c(0, 0, 0, 0), new = TRUE)
+plot(0, 0, type = "n", bty = "n", xaxt = "n", yaxt = "n")
+legend("bottom", horiz = TRUE, bty = "n", cex = 0.8,
+       fill = c(col_null, NA), border = NA, lty = c(NA, NA, 1), lwd = c(NA, NA, 2),
+       col = c(NA, NA, "firebrick"),
+       legend = c("Null: edges fixed", "Null: dyad census fixed", "Observed"))
+```
+
+
+```{r cug-nums}
+cg <- function(cc, st, md = "edges") cug[[paste(cc, st, md)]]
+r_tr <- sapply(names(nw), function(cc) cg(cc, "Transitivity")$obs / cg(cc, "Transitivity")$mean)
+r_ce <- sapply(names(nw), function(cc) cg(cc, "In-degree centralization")$obs /
+                                       cg(cc, "In-degree centralization")$mean)
+```
+
+**Results:** Both networks are more transitive and more centralized than
+chance. The largest p-value across the eight tests is `r f3(max(sapply(cug, function(x) x$p)))`. Holding the dyad census fixed changes little. So the clustering is not just a by-product of reciprocated ties.
+
+The size of the gap differs by country:
+
+-   **Transitivity** is `r f2(r_tr["CH"])` times its null mean in
+    Switzerland and `r f2(r_tr["FR"])` times in France.
+-   **In-degree centralization** is `r f2(r_ce["CH"])` times its null
+    mean in Switzerland and `r f2(r_ce["FR"])` times in France.
+
+The CUG test points against H1. Relative to chance, the Swiss network is more centralized than the French one. But CUG conditions only on density. It cannot separate concentration of in-ties from reciprocity, closure or actor attributes. 
+
+# QAP regression
+
+**Question:** Are collaboration ties associated with opposition, belief
+and instrument differences, and actor attributes?
+
+I regress the collaboration matrix on the dyadic covariates with a
+logistic network regression (`sna::netlogit`). The covariates are the
+same exogenous terms as in the original paper's ERGM. Node attributes enter as
+matrices: a sender matrix, a receiver matrix, or an absolute-difference
+matrix. P-values come from `r N_QAP` permutations with Dekker's double
+semi-partialling (`qapspp`). This method is robust to collinearity among
+the covariates. The coefficients are ordinary logit estimates. QAP
+corrects only their p-values for dependence among dyads.
+
+```{r qap}
+## ---- Helper: QAP covariate matrices ----------------------------------------
+## Every predictor must be an n x n matrix. Node attributes are spread out:
+##   sender effect   -> attribute repeated across each row    (matrix(x, n, n))
+##   receiver effect -> attribute repeated down each column   (byrow = TRUE)
+##   difference      -> |x_i - x_j|
+qap_X <- function(g) {
+  n <- network.size(g); nat <- as.numeric(g %v% "actorType" == "national")
+  rep <- g %v% "repuTarget"
+  list(g %n% "O", g %n% "B", g %n% "I",          # dyadic: opponent, belief, instrument
+       matrix(nat, n, n),                         # sender is national gov.
+       matrix(nat, n, n, byrow = TRUE),           # receiver is national gov.
+       matrix(rep, n, n),                         # sender reputation
+       abs(outer(rep, rep, "-")))                 # reputation difference
+}
+
+## ---- Term labels (same order as qap_X, plus intercept) ---------------------
+qap_names <- c("Intercept", "Opponent", "Belief dissim.", "Instrument dissim.",
+               "Out: national gov.", "In: national gov.", "Out: reputation", "Reputation diff.")
+
+## ---- Fit QAP logistic regression for each country --------------------------
+## qapspp = Dekker's double semi-partialling: permutes the residuals of each
+## predictor, which keeps p-values valid when predictors are correlated.
+qap <- lapply(nw, function(g) {
+  set.seed(123)
+  netlogit(as.sociomatrix(g), qap_X(g), nullhyp = "qapspp", reps = N_QAP)
+})
+
+## ---- Table 3: coefficients with stars, and two-sided p-values --------------
+## pgreqabs = share of permutations with |b| at least as large as observed.
+qap_tab <- data.frame(Term = qap_names,
+  sapply(names(qap), function(cc) paste0(f2(qap[[cc]]$coefficients),
+                                         stars(qap[[cc]]$pgreqabs))),
+  sapply(names(qap), function(cc) f3(qap[[cc]]$pgreqabs)), check.names = FALSE)
+names(qap_tab) <- c("Term", "Switzerland", "France", "p (CH)", "p (FR)")
+kab(qap_tab, sprintf("QAP logistic regression (two-sided p from %d qapspp permutations; * p < .05, ** p < .01)", N_QAP), "lrrrr")
+```
+
+```{r qap-nums}
+qp <- function(cc, k) qap[[cc]]$pgreqabs[k]; qb <- function(cc, k) qap[[cc]]$coefficients[k]
+```
+
+**Results:**
+
+-   **Opponents:** Naming someone an opponent raises the odds of also
+    naming them a collaborator. The effect is strong in Switzerland (b =
+    `r f2(qb("CH", 2))`, `r pf(qp("CH", 2))`) and smaller in France (b =
+    `r f2(qb("FR", 2))`, `r pf(qp("FR", 2))`).
+-   **Beliefs:** Belief dissimilarity has no effect in Switzerland
+    (`r pf(qp("CH", 3))`). In France it is negative but just misses the
+    .05 level (b = `r f2(qb("FR", 3))`, `r pf(qp("FR", 3))`).
+-   **Instruments:** Instrument dissimilarity lowers collaboration in
+    both countries (`r pf(qp("CH", 4))` and `r pf(qp("FR", 4))`).
+-   **Actors:** In France, national government actors receive more ties
+    (`r pf(qp("FR", 6))`). In Switzerland, pairs that differ in
+    reputation are more likely to be tied (`r pf(qp("CH", 8))`).
+
+The QAP model treats each tie as independent once the covariates are
+known. It has no terms for reciprocity, closure or popularity. 
+
+# ERGM
+
+**Specification:** I fit the authors' main model without the interaction
+in each country. It has the covariates from the QAP model plus three 
+endogenous terms:
+
+-   `mutual`: reciprocity.
+-   `gwesp(0.25)`: triadic closure (H2). Positive means ties form among
+    actors who share partners.
+-   `gwidegree(1.4)`: the in-degree distribution (H1). Negative means
+    in-ties concentrate on a few actors.
+
+I lengthen the MCMC interval to 5,000 to reduce autocorrelation.
+
+```{r ergm}
+## ---- ERGM specification (authors' main model, SI Table 4) ------------------
+## %s is a placeholder for the in-degree term, so the same model can be refit
+## with istar(2) as a robustness check.
+##   edges                 baseline tie propensity (intercept)
+##   edgecov("O")          i named j as an opponent           (H2: quality)
+##   gwesp(0.25)           triadic closure                    (H2: density)
+##   %s -> gwidegree(1.4)  in-degree concentration            (H1: power)
+##   edgecov("B"), ("I")   belief / instrument dissimilarity  (H2: quality)
+##   mutual                reciprocity
+##   nodeofactor/ifactor   national gov. as sender / receiver
+##   nodeocov, absdiff     sender reputation / reputation difference
+ergm_rhs <- 'edges + edgecov("O") + gwesp(0.25, fixed = TRUE) + %s +
+  edgecov("B") + edgecov("I") + mutual +
+  nodeofactor("actorType", levels = "national") +
+  nodeifactor("actorType", levels = "national") +
+  nodeocov("repuTarget") + absdiff("repuTarget")'
+
+## ---- Helper: fit one ERGM --------------------------------------------------
+## Decay values (0.25, 1.4) follow the authors. A long MCMC interval (5,000)
+## thins the chain to reduce autocorrelation between sampled networks.
+fit_ergm <- function(g, deg = "gwidegree(1.4, fixed = TRUE)")
+  ergm(as.formula(paste("g ~", sprintf(ergm_rhs, deg))),
+       control = control.ergm(seed = 123, MCMC.interval = 5000))
+
+## ---- Fit the main model in each country ------------------------------------
+ergm_fit <- lapply(nw, fit_ergm)
+
+## ---- Term labels (same order as the formula) -------------------------------
+ergm_names <- c("Edges", "Opponent", "GWESP (0.25)", "GWI-degree (1.4)",
+                "Belief dissim.", "Instrument dissim.", "Reciprocity",
+                "Out: national gov.", "In: national gov.", "Out: reputation", "Reputation diff.")
+
+## ---- Table 4: estimate, stars and standard error per country ---------------
+## Columns of summary()$coefficients: 1 = estimate, 2 = SE, 5 = p-value.
+ergm_tab <- data.frame(Term = ergm_names, sapply(ergm_fit, function(f) {
+  s <- summary(f)$coefficients
+  sprintf("%s%s (%s)", f2(s[, 1]), stars(s[, 5]), f2(s[, 2])) }), check.names = FALSE)
+names(ergm_tab) <- c("Term", "Switzerland", "France")
+
+## ---- Add BIC as a final row (used later to compare with istar(2)) ----------
+ergm_tab <- rbind(ergm_tab, data.frame(Term = "BIC", Switzerland = f2(BIC(ergm_fit$CH)),
+                                       France = f2(BIC(ergm_fit$FR))))
+kab(ergm_tab, "ERGM estimates (standard errors in parentheses; * p < .05, ** p < .01)", "lrr")
+```
+
+**Convergence:** Table 5 summarizes the MCMC sample from the final
+estimation round. A Geweke z-score beyond $\pm 2$ would signal that the
+chain had not settled. Lag-1 autocorrelation shows how much each draw
+depends on the last. The last column tests whether the simulated
+statistics are centered on the observed ones.
+
+```{r ergm-conv}
+conv_row <- function(f) {
+  sm <- as.matrix(f$sample)
+  z  <- geweke.diag(as.mcmc(sm))$z
+  ac <- apply(sm, 2, function(x) acf(x, lag.max = 1, plot = FALSE)$acf[2])
+  dev <- colMeans(sm)   # sample is stored as deviations from the observed statistics
+  c(`MCMC draws` = nrow(sm), `Max |Geweke z|` = f2(max(abs(z), na.rm = TRUE)),
+    `Max lag-1 autocorr.` = f2(max(ac, na.rm = TRUE)),
+    `Max |mean - obs| / SD` = f2(max(abs(dev) / apply(sm, 2, sd), na.rm = TRUE)))
+}
+ergm_conv <- data.frame(Country = CC, t(sapply(ergm_fit, conv_row)), check.names = FALSE)
+kab(ergm_conv, "ERGM MCMC diagnostics (final estimation round)", "lrrrr")
+```
+
+Both models converged. No Geweke z-score exceeds 2, and the simulated
+statistics sit close to the observed ones. Autocorrelation is moderate,
+so I keep the long MCMC interval.
+
+**Goodness of fit.** At the estimate, simulated networks reproduce the
+model's own statistics by construction. So I check four statistics the
+model was not fit to: the in-degree and out-degree distributions,
+edgewise shared partners, and geodesic distances. Table 6 counts, for
+each statistic, how many values fall outside the range of 100 simulated
+networks and how many have a Monte Carlo p-value below .05.
+
+```{r ergm-gof}
+gof_terms <- ~ idegree + odegree + espartners + distance
+gof_lab <- c(summary.ideg = "In-degree", summary.odeg = "Out-degree",
+             summary.espart = "Shared partners", summary.dist = "Geodesic distance")
+gof_count <- function(gf) sapply(names(gof_lab), function(k) {
+  m <- gf[[k]]
+  sprintf("%d / %d", sum(m[, "obs"] < m[, "min"] | m[, "obs"] > m[, "max"]),
+          sum(m[, "MC p-value"] < 0.05, na.rm = TRUE)) })
+
+ergm_gof <- lapply(ergm_fit, function(f)
+  ergm::gof(f, GOF = gof_terms, control = control.gof.ergm(seed = 123)))
+
+## Robustness: in-2-star in place of gwidegree (the authors' footnoted check)
+ergm_istar <- lapply(nw, function(g) tryCatch(fit_ergm(g, "istar(2)"),
+                                              error = function(e) conditionMessage(e)))
+istar_ok   <- !sapply(ergm_istar, is.character)
+gof_istar  <- lapply(ergm_istar[istar_ok], function(f)
+  ergm::gof(f, GOF = gof_terms, control = control.gof.ergm(seed = 123)))
+
+gt <- rbind(cbind(Model = "ERGM, gwidegree", Country = CC, t(sapply(ergm_gof, gof_count))),
+            cbind(Model = "ERGM, istar(2)", Country = CC[istar_ok],
+                  t(sapply(gof_istar, gof_count))))
+colnames(gt)[3:6] <- gof_lab
+kab(as.data.frame(gt), "ERGM goodness of fit: values outside the simulated range / values with MC p < .05", "llrrrr")
+```
+
+Fit is adequate in both countries. In France, no observed value falls
+outside the simulated range. Shared partners and distances fit well in
+both countries. The weak spot is the Swiss degree distribution. One
+in-degree value and one out-degree value fall outside the simulated
+range, and two in-degree values have small p-values. The model rarely
+produces a hub like the Swiss actor that
+`r max(degree(nw$CH, cmode = "indegree"))` of the other
+`r network.size(nw$CH) - 1` actors name.
+
+The authors report the same problem and use an in-2-star term as a
+robustness check. I do the same. In Switzerland the `istar(2)` model has
+a lower BIC (`r if (istar_ok["CH"]) f2(BIC(ergm_istar$CH))` vs.
+`r f2(BIC(ergm_fit$CH))`) and fits in-degree better, but it misses one
+shared-partner value. Its covariate estimates barely move (opponent
+`r if (istar_ok["CH"]) f2(coef(ergm_istar$CH)[2])`, instrument
+`r if (istar_ok["CH"]) f2(coef(ergm_istar$CH)[6])`).
+`r if (!istar_ok["FR"]) "In France the in-2-star model is degenerate: the MCMC sampler does not mix. This is a known risk of Markov terms in small, dense networks, and it is why the curved term is the main specification."`
+
+```{r ergm-nums}
+ec <- function(cc, k) summary(ergm_fit[[cc]])$coefficients[k, 1]
+ep <- function(cc, k) summary(ergm_fit[[cc]])$coefficients[k, 5]
+```
+
+**Results.**
+
+-   **H1, power:** GWI-degree is negative in both countries: in-ties
+    concentrate on a few actors. The coefficient is more negative in
+    France (`r f2(ec("FR", 4))`) than in Switzerland
+    (`r f2(ec("CH", 4))`). The authors find the same contrast with
+    predicted probabilities. This is the pattern H1 predicts, and it
+    reverses the raw CUG comparison.
+-   **H2, closure:** GWESP is positive in both countries
+    (`r f2(ec("CH", 3))` and `r f2(ec("FR", 3))`). This agrees with the
+    CUG test.
+-   **H2, opponents:** The opponent effect is positive and strong in
+    Switzerland (`r f2(ec("CH", 2))`, `r pf(ep("CH", 2))`). In France it
+    is smaller and not significant at .05 (`r f2(ec("FR", 2))`,
+    `r pf(ep("FR", 2))`).
+-   **H2, beliefs:** Belief dissimilarity matters only in France
+    (`r f2(ec("FR", 5))`, `r pf(ep("FR", 5))`). In Switzerland it is
+    null.
+
+Coefficients are not strictly comparable across networks of different
+size and density. Hence, the country contrasts show patterns of sign
+and significance only.
+
+# Latent space model
+
+**Specification:** The latent space model (LSM) places each actor at a
+point in a latent social space. The closer two actors are, the more
+likely a tie between them. Closeness is transitive: if $i$ is near $j$
+and $j$ is near $k$, then $i$ is near $k$. So the model captures
+clustering without a closure term. I include the same covariates as in
+the QAP and ERGM models.
+
+I compared four specifications in each country by BIC and goodness of
+fit:
+
+-   latent dimension 1 or 2;
+-   with or without sender and receiver random effects. These let each
+    actor have its own tendency to send and to receive ties. The
+    receiver variance measures how unequal popularity is, which relates
+    to H1.
+
+```{r lsm-select}
+## ---- LSM covariates (same exogenous terms as QAP and ERGM) -----------------
+## No gwesp or gwidegree here: the latent space absorbs clustering, and the
+## random effects (when included) absorb degree heterogeneity.
+lsm_cov <- '+ edgecov("O") + edgecov("B") + edgecov("I") +
+  nodeofactor("actorType", levels = "national") + nodeifactor("actorType", levels = "national") +
+  nodeocov("repuTarget") + absdiff("repuTarget")'
+
+## ---- Candidate specifications ---------------------------------------------
+## euclidean(d): tie probability falls with distance in a d-dimensional space
+## rsender / rreceiver: actor-level random effects for sending / receiving ties
+##   (receiver variance = how unequal popularity is, related to H1)
+lsm_specs <- c("d = 1"                = "euclidean(d = 1)",
+               "d = 2"                = "euclidean(d = 2)",
+               "d = 1, sender/receiver" = "euclidean(d = 1) + rsender + rreceiver",
+               "d = 2, sender/receiver" = "euclidean(d = 2) + rsender + rreceiver")
+
+## ---- Helper: fit one LSM ---------------------------------------------------
+fit_lsm <- function(g, spec, ctrl)
+  ergmm(as.formula(paste("g ~", spec, lsm_cov)), control = ctrl, seed = 123)
+
+## ---- Specification search -------------------------------------------------
+## Shorter chains are enough to compare models; the chosen model is refit
+## later with a longer chain.
+sel_ctrl <- ergmm.control(burnin = 50000, sample.size = 4000, interval = 10)
+
+## Fit each specification in each country, then record BIC and GOF counts
+lsm_sel <- list()
+for (cc in names(nw)) for (s in names(lsm_specs)) {
+  m <- fit_lsm(nw[[cc]], lsm_specs[s], sel_ctrl)
+  set.seed(123)
+  gf <- gof(m, GOF = gof_terms, nsim = 100)   # same GOF statistics as the ERGM
+  lsm_sel[[paste(cc, s)]] <- c(Country = CC[[cc]], Specification = s,
+                               BIC = f2(summary(m)$bic$overall), gof_count(gf))
+}
+
+## ---- Table 7: BIC and GOF for each specification ---------------------------
+sel_tab <- as.data.frame(do.call(rbind, lsm_sel), check.names = FALSE)
+names(sel_tab)[4:7] <- gof_lab
+kab(sel_tab, "LSM specification search. BIC (lower is better) and goodness of fit (values outside the simulated range / values with MC p < .05)", "llrrrrr")
+```
+
+In Switzerland, models without random effects leave observed values
+outside the simulated range on most statistics. Adding sender and
+receiver effects in one dimension leaves only one, on out-degree. That
+model also has the lowest BIC. In France every specification fits, and
+BIC prefers the simplest model.
+
+I use **one dimension with sender and receiver effects** in both
+countries. It is the best model for Switzerland, and it fits France
+well. Using one specification keeps the two countries comparable, as in
+the ERGM.
+
+**Estimation and convergence.** I run a longer chain for the final
+models: 200,000 burn-in iterations, then 10,000 draws kept from every
+50th iteration. Table 8 reports two checks on the coefficient draws and
+the log-likelihood. The effective sample size (ESS) is the number of
+independent draws the chain is worth. Geweke z compares the start and
+the end of the chain.
+
+```{r lsm-fit}
+final_spec <- lsm_specs["d = 1, sender/receiver"]
+fin_ctrl   <- ergmm.control(burnin = 200000, sample.size = 10000, interval = 50)
+lsm_fit <- lapply(nw, function(g) fit_lsm(g, final_spec, fin_ctrl))
+
+lsm_draws <- function(m) {
+  b <- m$sample$beta; colnames(b) <- m$model$coef.names
+  cbind(b, lpY = m$sample$lpY, receiver.var = m$sample$receiver.var)
+}
+lsm_conv <- data.frame(Country = CC, t(sapply(lsm_fit, function(m) {
+  d <- as.mcmc(lsm_draws(m))
+  ess <- effectiveSize(d); z <- geweke.diag(d)$z
+  c(Draws = nrow(d), `Min ESS` = round(min(ess)),
+    `Lowest-ESS term` = names(which.min(ess)),
+    `Max |Geweke z|` = f2(max(abs(z))))
+})), check.names = FALSE)
+kab(lsm_conv, "LSM MCMC diagnostics (coefficients, receiver variance and log-likelihood)", "lrrlr")
+```
+
+```{r fig-trace, fig.width = 7.5, fig.height = 4.2, fig.cap = "LSM trace plots for the three dyadic covariates."}
+par(mfrow = c(2, 3), mar = c(4, 4, 2.5, 1))
+for (cc in names(nw)) {
+  d <- lsm_draws(lsm_fit[[cc]])
+  for (k in c("edgecov.O", "edgecov.B", "edgecov.I"))
+    plot(d[, k], type = "l", col = "grey30", xlab = "Draw", ylab = "Value",
+         main = paste(CC[cc], "-", c(edgecov.O = "Opponent", edgecov.B = "Belief dissim.",
+                                     edgecov.I = "Instrument dissim.")[k]), cex.main = 0.9)
+}
+```
+
+The chains converged. The trace plots show no drift. The largest Geweke
+z-score is `r max(as.numeric(lsm_conv[["Max |Geweke z|"]]))`, inside
+$\pm 2$. The smallest effective sample size is
+`r min(as.numeric(lsm_conv[["Min ESS"]]))` draws.
+
+```{r lsm-gof}
+lsm_gof <- lapply(lsm_fit, function(m) { set.seed(123); gof(m, GOF = gof_terms, nsim = 100) })
+lg <- data.frame(Country = CC, t(sapply(lsm_gof, gof_count)), check.names = FALSE)
+n_out <- sapply(lsm_gof, function(gf) sum(sapply(names(gof_lab), function(k) {
+  m <- gf[[k]]; sum(m[, "obs"] < m[, "min"] | m[, "obs"] > m[, "max"]) })))
+lsm_gof_text <- if (all(n_out == 0)) {
+  "In both countries, no observed value falls outside the simulated range on any statistic."
+} else paste(sapply(names(n_out), function(cc) sprintf("In %s, %s observed value%s outside the simulated range.",
+  CC[cc], ifelse(n_out[cc] == 0, "no", n_out[cc]), ifelse(n_out[cc] == 1, " falls", "s fall"))), collapse = " ")
+names(lg)[2:5] <- gof_lab
+kab(lg, "Final LSM goodness of fit: values outside the simulated range / values with MC p < .05", "lrrrr")
+```
+
+```{r fig-ideg, fig.width = 7.5, fig.height = 5, fig.cap = "In-degree fit for the ERGM and the LSM. The black line is the observed count. Points are simulated means and grey bars are simulated ranges."}
+plot_ideg <- function(gf, main) {
+  m <- gf$summary.ideg
+  k <- as.integer(rownames(m)); keep <- k <= max(k[m[, "obs"] > 0]) + 2
+  m <- m[keep, , drop = FALSE]; k <- k[keep]
+  plot(k, m[, "obs"], type = "n", ylim = range(m[, c("min", "max", "obs")]),
+       xlab = "In-degree", ylab = "Number of actors", main = main, cex.main = 0.9)
+  segments(k, m[, "min"], k, m[, "max"], col = "grey75", lwd = 5)
+  points(k, m[, "mean"], pch = 19, cex = 0.7, col = "#0072B2")
+  lines(k, m[, "obs"], lwd = 2)
+}
+par(mfrow = c(2, 2), mar = c(4, 4, 2.5, 1))
+for (cc in names(nw)) {
+  plot_ideg(ergm_gof[[cc]], paste(CC[cc], "- ERGM"))
+  plot_ideg(lsm_gof[[cc]],  paste(CC[cc], "- LSM"))
+}
+```
+
+The final LSM fits both networks. `r lsm_gof_text` On in-degree, the LSM
+fits Switzerland better than the ERGM does (Figure 3). The receiver
+effects let one actor be very popular without forcing the model to
+change the whole degree distribution.
+
+```{r lsm-tab}
+lsm_names <- c("Intercept", "Opponent", "Belief dissim.", "Instrument dissim.",
+               "Out: national gov.", "In: national gov.", "Out: reputation", "Reputation diff.")
+lsm_ci <- lapply(lsm_fit, function(m) summary(m)$pmean$coef.table)
+lsm_tab <- data.frame(Term = lsm_names, sapply(lsm_ci, function(t) {
+  sig <- ifelse(t[, 2] > 0 | t[, 3] < 0, "*", "")
+  sprintf("%s%s [%s, %s]", f2(t[, 1]), sig, f2(t[, 2]), f2(t[, 3])) }), check.names = FALSE)
+names(lsm_tab) <- c("Term", "Switzerland", "France")
+rv <- sapply(lsm_fit, function(m) m$sample$receiver.var)
+sv <- sapply(lsm_fit, function(m) m$sample$sender.var)
+vr <- function(x) sprintf("%s [%s, %s]", f2(mean(x)), f2(quantile(x, .025)), f2(quantile(x, .975)))
+lsm_tab <- rbind(lsm_tab,
+  data.frame(Term = "Sender variance",   Switzerland = vr(sv[, "CH"]), France = vr(sv[, "FR"])),
+  data.frame(Term = "Receiver variance", Switzerland = vr(rv[, "CH"]), France = vr(rv[, "FR"])))
+kab(lsm_tab, "LSM posterior means with 95% credible intervals (* interval excludes zero)", "lrr")
+```
+
+```{r lsm-nums}
+lc <- function(cc, k) as.numeric(lsm_ci[[cc]][k, 1:3])
+excl0 <- function(cc, k) { x <- lc(cc, k); x[2] > 0 | x[3] < 0 }
+```
+
+**Results.**
+
+-   **Opponents:** The opponent effect is positive in Switzerland
+    (`r f2(lc("CH", 2)[1])`). Its interval excludes zero. In France the
+    estimate is positive (`r f2(lc("FR", 2)[1])`), but the interval
+    includes zero.
+-   **Beliefs:** Belief dissimilarity is null in Switzerland. In France
+    it is `r f2(lc("FR", 3)[1])` with interval [`r f2(lc("FR", 3)[2])`,
+    `r f2(lc("FR", 3)[3])`].
+-   **Instruments:** Instrument dissimilarity is negative in Switzerland
+    (`r f2(lc("CH", 4)[1])`). In France it is `r f2(lc("FR", 4)[1])`
+    with interval [`r f2(lc("FR", 4)[2])`, `r f2(lc("FR", 4)[3])`].
+-   **Popularity:** The receiver variance is `r f2(mean(rv[, "CH"]))` in
+    Switzerland and `r f2(mean(rv[, "FR"]))` in France. Actors differ a
+    lot in how often others name them, in both countries.
+
+# Are the inferences robust?
+
+Table 11 puts the three dyadic covariates and the national-government
+receiver effect side by side across the three regression-type methods.
+The estimates are on the log-odds scale in all three, but each
+conditions on different things. QAP adjusts only the p-values for
+dependence. The ERGM models dependence through explicit network terms.
+The LSM models it through latent positions and actor random effects.
+
+```{r compare}
+cell_qap  <- function(cc, k) paste0(f2(qap[[cc]]$coefficients[k]), stars(qap[[cc]]$pgreqabs[k]))
+cell_ergm <- function(cc, k) { s <- summary(ergm_fit[[cc]])$coefficients
+  paste0(f2(s[k, 1]), stars(s[k, 5])) }
+cell_lsm  <- function(cc, k) { t <- lsm_ci[[cc]]
+  paste0(f2(t[k, 1]), ifelse(t[k, 2] > 0 | t[k, 3] < 0, "*", "")) }
+terms <- list(Opponent = c(2, 2, 2), `Belief dissim.` = c(3, 5, 3),
+              `Instrument dissim.` = c(4, 6, 4), `In: national gov.` = c(6, 9, 6))
+cmp <- do.call(rbind, lapply(names(terms), function(tn) { k <- terms[[tn]]
+  data.frame(Term = tn,
+             `QAP CH` = cell_qap("CH", k[1]), `ERGM CH` = cell_ergm("CH", k[2]), `LSM CH` = cell_lsm("CH", k[3]),
+             `QAP FR` = cell_qap("FR", k[1]), `ERGM FR` = cell_ergm("FR", k[2]), `LSM FR` = cell_lsm("FR", k[3]),
+             check.names = FALSE) }))
+kab(cmp, "Covariate effects across methods. QAP and ERGM: * p < .05, ** p < .01. LSM: * 95% interval excludes zero.", "lrrrrrr")
+```
+
+**Robust results.**
+
+-   **Instrument dissimilarity** lowers collaboration in both countries
+    under every method. Actors work with those who prefer the same
+    policy tools.
+-   **The Swiss opponent effect** is positive and significant in all
+    three models. Swiss actors collaborate with the actors they name as
+    opponents. This supports the consensus-democracy part of H2.
+-   **Belief dissimilarity in Switzerland** is null in all three models.
+    Swiss actors collaborate across differences in core beliefs.
+-   **Structure:** The CUG test, the ERGM's GWESP term and the LSM all
+    point to strong clustering in both networks. The CUG test and both
+    models also find unequal popularity.
+
+**Results that depend on the method**
+
+-   **The French opponent effect** is significant only in QAP. Once
+    reciprocity and closure (ERGM) or latent positions (LSM) are
+    modeled, it is no longer distinguishable from zero. QAP treats each
+    tie as a separate observation given the covariates. Part of what it
+    credits to opposition is carried by network structure.
+-   **Belief dissimilarity in France** is negative in all three models.
+    It is significant in the ERGM and the LSM, and just misses .05 in
+    QAP (`r pf(qp("FR", 3))`). The direction is robust; the precision is
+    not. With 18 actors, every French estimate is imprecise.
+-   **National government in France** receives more ties in all three
+    models. The effect is significant in QAP and the ERGM.
+    `r if (excl0("FR", 6)) "In the LSM its interval excludes zero, but only barely" else "In the LSM its interval includes zero"`
+    ([`r f2(lc("FR", 6)[2])`, `r f2(lc("FR", 6)[3])`]).
+-   **Centralization (H1):** The CUG test finds Switzerland more
+    centralized relative to chance. The ERGM finds a steeper
+    concentration of in-ties in France. The LSM sides with the ERGM: the
+    receiver variance is larger in France (`r f2(mean(rv[, "FR"]))` vs.
+    `r f2(mean(rv[, "CH"]))`), though the intervals overlap. The methods
+    answer different questions. CUG conditions only on density. The two
+    models ask whether popularity is unequal once covariates and other
+    network structure are accounted for. The H1 conclusion therefore
+    depends on what one holds fixed.
+
+**Summary:** The consensus-system findings for Switzerland are robust
+across methods: collaboration with opponents, collaboration across
+belief differences, and strong closure. The majoritarian-system findings
+for France are weaker. The French network is small, and more than half
+of the actors did not respond. The French opponent effect does not
+survive models that account for network dependence.
+
+```{r session, results = "asis"}
+si <- sessionInfo()
+pk <- c("network", "sna", "ergm", "latentnet")
+cat(sprintf("Run with %s; %s.", si$R.version$version.string,
+            paste(sprintf("%s %s", pk, sapply(pk, function(p) as.character(packageVersion(p)))),
+                  collapse = ", ")))
+```
