@@ -43,10 +43,7 @@ CC    <- c(CH = "Switzerland", FR = "France")
 
 # Reproducibility
 
-The data and code accompany this write-up. Place this `.Rmd` next to a
-`data/` folder holding `data_prepared.RData` and `attributeData.RData`
-from the authors' Dataverse archive (`0_Data/` and
-`1_Analysis/output/`). Every random step uses seed 123.
+Replication data: \url{https://github.com/yasinshafi/508-problem-set-2} 
 
 # Data
 
@@ -209,7 +206,7 @@ cug_tab <- do.call(rbind, lapply(cug, function(x) data.frame(
 kab(cug_tab, sprintf("CUG tests (%d draws per null)", N_CUG), "lllrrrr")
 ```
 
-```{r fig-cug, fig.width = 7.5, fig.height = 4.5, fig.cap = "CUG null distributions holding the number of ties fixed. The red line is the observed value."}
+```{r fig-cug, fig.width = 7.5, fig.height = 4.5, fig.cap = "CUG null distributions. Grey: ties held fixed. Blue: dyad census held fixed. The red line is the observed value."}
 
 ## ---- Figure 1: observed vs. both null distributions ------------------------
 col_null <- c(edges       = adjustcolor("grey50", 0.5),
@@ -564,9 +561,9 @@ kab(sel_tab, "LSM specification search. BIC (lower is better) and goodness of fi
 
 In Switzerland, models without random effects leave observed values
 outside the simulated range on most statistics. Adding sender and
-receiver effects in one dimension leaves only one, on out-degree. That
-model also has the lowest BIC. In France every specification fits, and
-BIC prefers the simplest model.
+receiver effects in one dimension leaves no observed value outside the
+simulated range. That model also has the lowest BIC. In France every
+specification fits, and BIC prefers the simplest model.
 
 I use **one dimension with sender and receiver effects** in both
 countries. It is the best model for Switzerland, and it fits France
@@ -610,9 +607,10 @@ for (cc in names(nw)) {
 }
 ```
 
-The chains converged. The trace plots show no drift. The largest Geweke
-z-score is `r max(as.numeric(lsm_conv[["Max |Geweke z|"]]))`, inside
-$\pm 2$. The smallest effective sample size is
+The trace plots show no drift. The largest Geweke z-score is
+`r max(as.numeric(lsm_conv[["Max |Geweke z|"]]))`.
+`r if (max(as.numeric(lsm_conv[["Max |Geweke z|"]])) <= 2) "All values are inside $\\pm 2$." else "One value is slightly above 2. With about a dozen monitored quantities, one such value is expected by chance."`
+The smallest effective sample size is
 `r min(as.numeric(lsm_conv[["Min ESS"]]))` draws.
 
 ```{r lsm-gof}
@@ -665,7 +663,7 @@ vr <- function(x) sprintf("%s [%s, %s]", f2(mean(x)), f2(quantile(x, .025)), f2(
 lsm_tab <- rbind(lsm_tab,
   data.frame(Term = "Sender variance",   Switzerland = vr(sv[, "CH"]), France = vr(sv[, "FR"])),
   data.frame(Term = "Receiver variance", Switzerland = vr(rv[, "CH"]), France = vr(rv[, "FR"])))
-kab(lsm_tab, "LSM posterior means with 95% credible intervals (* interval excludes zero)", "lrr")
+kab(lsm_tab, "LSM posterior means with 95\\% credible intervals (* interval excludes zero)", "lrr")
 ```
 
 ```{r lsm-nums}
@@ -711,7 +709,7 @@ cmp <- do.call(rbind, lapply(names(terms), function(tn) { k <- terms[[tn]]
              `QAP CH` = cell_qap("CH", k[1]), `ERGM CH` = cell_ergm("CH", k[2]), `LSM CH` = cell_lsm("CH", k[3]),
              `QAP FR` = cell_qap("FR", k[1]), `ERGM FR` = cell_ergm("FR", k[2]), `LSM FR` = cell_lsm("FR", k[3]),
              check.names = FALSE) }))
-kab(cmp, "Covariate effects across methods. QAP and ERGM: * p < .05, ** p < .01. LSM: * 95% interval excludes zero.", "lrrrrrr")
+kab(cmp, "Covariate effects across methods. QAP and ERGM: * p < .05, ** p < .01. LSM: * 95\\% interval excludes zero.", "lrrrrrr")
 ```
 
 **Robust results.**
